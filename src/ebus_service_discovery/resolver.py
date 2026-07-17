@@ -2,7 +2,10 @@
 
 The resolver keeps a fresh in-memory view of active ``Record``s (dropping
 tombstones) and resolves a target service to a reachable endpoint by ordering
-candidate addresses routable-first and TCP-probing each. The probe binds to the
+candidate addresses routable-first and TCP-probing each. It also tracks the
+publisher's Homie-style ``$state`` liveness (``bus_ready`` / ``publisher_state``),
+the bus-level replacement for per-record TTL staleness: the records are worth
+trusting only while the publisher is ``ready``. The probe binds to the
 record's interface (``SO_BINDTODEVICE``) and connects to the address as-is, so
 an unreachable IPv4 (for example an APIPA lease) is simply skipped in favor of a
 working IPv6 -- no family-specific special-casing, and the reachability logic
@@ -78,18 +81,42 @@ class ServiceResolver:
         self._lock = threading.RLock()
         self._records: dict[_ViewKey, Record] = {}
         self._watched: set[str] = set()
+        self._publisher_state: str | None = None
+        self._state_watched = False
+        self._state_topic = f"{self._base}/$state"
 
     # --- subscription -----------------------------------------------------
 
     def watch(self, service_type: str) -> None:
-        """Subscribe to every advertisement of ``service_type`` on the bus."""
+        """Subscribe to every advertisement of ``service_type`` on the bus.
+
+        Also ensures a subscription to the bus liveness topic ``{base}/$state``
+        so ``publisher_state`` / ``bus_ready`` track the publisher.
+        """
+        self._watch_state()
         with self._lock:
             if service_type in self._watched:
                 return
             self._watched.add(service_type)
         self._mqtt.subscribe(f"{self._base}/{service_type}/+/+", param=self._on_message)
 
+    def _watch_state(self) -> None:
+        """Subscribe to the ``{base}/$state`` liveness topic exactly once."""
+        with self._lock:
+            if self._state_watched:
+                return
+            self._state_watched = True
+        self._mqtt.subscribe(self._state_topic, param=self._on_message)
+
     def _on_message(self, topic: str, payload: bytes | bytearray) -> None:
+        if topic == self._state_topic:
+            # {base}/$state is the publisher liveness signal, not a record. An
+            # empty payload means the publisher cleared it (gone). Handle it
+            # before the record path, which would otherwise log it unparseable.
+            text = bytes(payload).decode("utf-8", "replace").strip() if payload else ""
+            with self._lock:
+                self._publisher_state = text or None
+            return
         key = self._key_from_topic(topic)
         if key is None:
             logger.warning("reason=discoveryTopicUnparsed,topic=%s", topic)
@@ -129,24 +156,38 @@ class ServiceResolver:
         service_type, interface, instance = parts
         return (service_type, interface, unquote(instance))
 
-    def records(
-        self, service_type: str | None = None, *, include_stale: bool = True
-    ) -> list[Record]:
-        """Snapshot of active records, optionally filtered by type / freshness."""
+    def records(self, service_type: str | None = None) -> list[Record]:
+        """Snapshot of the current active records, optionally filtered by type.
+
+        Freshness is a bus-level property now (see ``bus_ready`` /
+        ``publisher_state``), not a per-record one, so there is no stale filter.
+        """
         with self._lock:
             recs = list(self._records.values())
         if service_type is not None:
             recs = [r for r in recs if r.service_type == service_type]
-        if not include_stale:
-            recs = [r for r in recs if not r.is_stale()]
         return recs
 
-    def prune_stale(self) -> None:
-        """Drop records that have outlived their ttl (a client-side backstop)."""
+    # --- publisher liveness ($state) --------------------------------------
+
+    @property
+    def publisher_state(self) -> str | None:
+        """The publisher's last-seen Homie-style ``$state`` (``ready`` / ``init``
+        / ``disconnected`` / ``lost``), or None if none seen or it was cleared."""
         with self._lock:
-            for key, record in list(self._records.items()):
-                if record.is_stale():
-                    del self._records[key]
+            return self._publisher_state
+
+    @property
+    def bus_ready(self) -> bool:
+        """True iff the publisher is ``ready`` (live and maintaining the tree).
+
+        Gate trust in the records on this: while not ready (init/disconnected/
+        lost/unknown) the tree is either rebuilding or an unmaintained snapshot.
+        A dead publisher sends no clears, so the view naturally keeps the
+        last-known records; ``bus_ready`` tells the consumer not to trust them.
+        """
+        with self._lock:
+            return self._publisher_state == "ready"
 
     # --- resolution -------------------------------------------------------
 

@@ -71,20 +71,33 @@ Keying by **instance** (not hostname) is deliberate: DNS-SD identity lives in th
 | `txt` | object of string→string | yes | DNS-SD TXT key/values. |
 | `state` | `"active"` \| `"removed"` | yes | `removed` is a tombstone (see below). |
 | `first_seen` | RFC 3339 UTC | yes | When first observed. |
-| `last_seen` | RFC 3339 UTC | yes | When most recently confirmed. Authoritative freshness. |
-| `ttl_seconds` | int | no | Advertised TTL / expected refresh window. |
+| `last_seen` | RFC 3339 UTC | yes | When discovery last confirmed the service. Observability only, NOT a liveness signal (see [bus liveness](#bus-liveness-state)). |
+| `ttl_seconds` | int | no | Optional, usually omitted. A weak per-record hint at most; `$state` bus liveness is the real freshness signal. |
 | `removed_at` | RFC 3339 UTC | iff removed | Tombstone timestamp. |
 
 Addresses are carried **raw** — only `{address, family}`. Scope, APIPA, and link-local classification are *derived client-side* from the address value (see [the model](#the-model-record--address)) so the taxonomy can evolve without a contract change.
 
-### Tombstones and freshness
+### Tombstones and removal
 
 A record is **removed** in one of two ways, and a consumer honors both:
 
-1. **Tombstone message** — a retained record with `state: "removed"` (the full last-known fields plus `removed_at`). This is the primary mechanism; it fires on a DNS-SD goodbye, a TTL expiry, or a browse `ItemRemove`.
+1. **Tombstone message** — a retained record with `state: "removed"` (the full last-known fields plus `removed_at`). It fires on a DNS-SD goodbye or a browse `ItemRemove`.
 2. **Empty retained payload** — clearing the retained topic (a zero-length message) also means "gone."
 
-**Freshness** is `age = now - last_seen`. A consumer can also age a record out itself once `age > ttl_seconds` (a backstop for a missed tombstone) via `Record.is_stale(...)`.
+`last_seen` / `ttl_seconds` / `Record.is_stale()` are **observability only**, not a liveness signal. In an event-driven publisher a stable service is confirmed once at discovery and then never re-emitted, so `last_seen` ages indefinitely while the service is perfectly present; `is_stale()` therefore means "not recently re-confirmed by discovery," NOT "gone." Whether the tree is trustworthy at all is a **bus-level** question, answered by `$state`.
+
+### Bus liveness (`$state`)
+
+The publisher maintains one retained topic, **`{base}/v1/$state`**, a bare lifecycle string borrowed from the Homie 5 device lifecycle (the state-machine semantics only — this is a private topic, not a Homie device, and it is invisible to generic Homie controllers):
+
+| Value | Meaning |
+|---|---|
+| `init` | Publisher connected; the tree is (re)building (startup clear + browse, or a discovery-daemon reconnect). Records are transient — wait for `ready`. |
+| `ready` | The tree is published and actively maintained. **Unlike Homie, `ready` does NOT freeze the structure**: the record SET churns continuously, so keep a live subscription rather than snapshotting once at `ready`. |
+| `disconnected` | Clean shutdown; the tree is a frozen last-known snapshot. |
+| `lost` | The publisher's **MQTT Last Will**: the broker sets this on an ungraceful disconnect. The tree is abandoned. |
+
+A consumer **gates its trust on `ready`** via `ServiceResolver.bus_ready`. While not ready, the retained records are either rebuilding or an unmaintained snapshot; a dead publisher sends no clears, so the resolver naturally keeps the last-known records, and `bus_ready == False` is the signal not to trust them. A crash-restart can briefly overwrite a live `ready` with a late will (it fires ~1.5x the MQTT keepalive after the old socket dies), so a consumer should **debounce `lost`** rather than reacting to it instantly.
 
 ### Example
 
@@ -152,6 +165,10 @@ resolver.watch("_http._tcp")
 mqtt.start()
 # ... let retained records arrive ...
 
+# Trust the bus only while the publisher is live (see "Bus liveness" above):
+if not resolver.bus_ready:
+    print("bus not ready (publisher init/lost); use last-known cautiously")
+
 # Resolve a specific instance (match on a TXT field), on port 443 regardless of
 # the advertised port:
 res = resolver.resolve(
@@ -179,7 +196,7 @@ Constructor options:
 | `prefer_family` | `None` | `AddressFamily.IPV4`/`IPV6` as a tie-breaker (never overrides scope). |
 | `interface_priority` | `[]` | Ordered interface names to prefer, e.g. `["eth1", "eth0", "wlan0"]`. |
 
-Other methods: `records(service_type=None, include_stale=True)` snapshots the current view; `prune_stale()` drops aged-out records; `ingest(record)` applies a record directly (for non-MQTT feeds or tests).
+Other members: `records(service_type=None)` snapshots the current view; `publisher_state` / `bus_ready` expose the bus `$state` liveness (gate your trust on `bus_ready`); `ingest(record)` applies a record directly (for non-MQTT feeds or tests).
 
 ### Schema validation
 
@@ -263,7 +280,7 @@ Exit code is non-zero if any record is invalid.
 
 ### `stats` — characterize the live bus
 
-A one-shot summary of what is currently on the bus: totals, per-interface counts, and the service-type breakdown. `--json` emits the raw characterization dict.
+A one-shot summary of what is currently on the bus: the publisher `$state`, totals, per-interface counts, and the service-type breakdown. `--json` emits the raw characterization dict with a `publisher_state` field.
 
 ```bash
 service-discovery stats
@@ -272,6 +289,7 @@ service-discovery stats
 ```
 discovery bus stats
   base           local/mdns/discovery/v1
+  publisher      ready
   service-types  12
   instances      41
   addresses      63

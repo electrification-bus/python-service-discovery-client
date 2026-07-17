@@ -48,13 +48,14 @@ def _resolver(**kw):
 # --- subscription / view ---------------------------------------------------
 
 
-def test_watch_subscribes_to_service_filter():
+def test_watch_subscribes_to_service_filter_and_state():
     mqtt = FakeMqtt()
     r = ServiceResolver(mqtt)
     r.watch("_example._tcp")
     assert "local/mdns/discovery/v1/_example._tcp/+/+" in mqtt.subs
-    r.watch("_example._tcp")  # idempotent
-    assert len(mqtt.subs) == 1
+    assert "local/mdns/discovery/v1/$state" in mqtt.subs  # liveness auto-subscribed
+    r.watch("_example._tcp")  # idempotent (service filter + $state, no dupes)
+    assert len(mqtt.subs) == 2
 
 
 def test_on_message_active_then_empty_tombstone():
@@ -89,6 +90,48 @@ def test_key_from_topic_percent_decode():
     key = r._key_from_topic("local/mdns/discovery/v1/_example._tcp/eth0/Dev%20One")
     assert key == ("_example._tcp", "eth0", "Dev One")
     assert r._key_from_topic("some/other/topic") is None
+
+
+# --- publisher liveness ($state) -------------------------------------------
+
+_STATE = "local/mdns/discovery/v1/$state"
+
+
+def test_state_topic_sets_publisher_state_not_a_record():
+    r = _resolver()
+    r._on_message(_STATE, b"ready")
+    assert r.publisher_state == "ready"
+    assert r.bus_ready is True
+    assert r.records() == []  # $state is liveness, never a record
+
+
+def test_bus_ready_only_when_ready():
+    r = _resolver()
+    assert r.publisher_state is None and r.bus_ready is False  # unknown until seen
+    r._on_message(_STATE, b"init")
+    assert r.publisher_state == "init" and r.bus_ready is False
+    r._on_message(_STATE, b"ready")
+    assert r.bus_ready is True
+    r._on_message(_STATE, b"lost")
+    assert r.publisher_state == "lost" and r.bus_ready is False
+
+
+def test_empty_state_payload_clears_publisher_state():
+    r = _resolver()
+    r._on_message(_STATE, b"ready")
+    r._on_message(_STATE, b"")  # zero-length $state = publisher gone
+    assert r.publisher_state is None and r.bus_ready is False
+
+
+def test_dead_publisher_view_keeps_last_known_records():
+    # A dead publisher sends no clears, so the view naturally keeps its records;
+    # bus_ready flips false via the LWT so the consumer knows not to trust them.
+    r = _resolver()
+    rec = _record(addrs=["192.168.1.10"])
+    r._on_message(rec.topic(), rec.to_json().encode())
+    r._on_message(_STATE, b"lost")
+    assert r.bus_ready is False
+    assert len(r.records("_example._tcp")) == 1  # last-known retained
 
 
 # --- resolution ------------------------------------------------------------

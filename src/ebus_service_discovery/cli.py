@@ -122,7 +122,15 @@ SNAPSHOT_VERSION = 1
 _DIFF_LIST_CAP = 20
 
 
-def snapshot_payload(records: list[dict], *, base: str, host: str, port: int, now=None) -> dict:
+def snapshot_payload(
+    records: list[dict],
+    *,
+    base: str,
+    host: str,
+    port: int,
+    publisher_state: str | None = None,
+    now=None,
+) -> dict:
     """Wrap enriched record dicts with capture metadata so two snapshots taken
     at different times can be characterized and compared."""
     now = now or datetime.now(timezone.utc)
@@ -132,6 +140,7 @@ def snapshot_payload(records: list[dict], *, base: str, host: str, port: int, no
         "base": base,
         "host": host,
         "port": port,
+        "publisher_state": publisher_state,
         "record_count": len(records),
         "records": records,
     }
@@ -333,12 +342,13 @@ def render_diff(old_meta: dict, old_c: dict, new_meta: dict, new_c: dict, diff: 
     return "\n".join(lines)
 
 
-def render_stats(char: dict, meta: dict | None = None) -> str:
+def render_stats(char: dict, meta: dict | None = None, publisher_state: str | None = None) -> str:
     """A one-shot characterization of the live bus: totals, per-interface, and
     the service-type breakdown."""
     lines = ["discovery bus stats"]
     if meta and meta.get("base"):
         lines.append(f"  base           {meta['base']}")
+    lines.append(f"  publisher      {publisher_state or 'unknown'}")
     lines.append(f"  service-types  {char['service_types']}")
     lines.append(f"  instances      {char['instances']}")
     lines.append(f"  addresses      {char['addresses']}")
@@ -369,13 +379,24 @@ def render_stats(char: dict, meta: dict | None = None) -> str:
 # --- MQTT-backed commands (lazy import) -----------------------------------
 
 
-def _collect(host, port, patterns, window):
-    """Connect, subscribe, collect the latest Record per topic for `window` s."""
+def _collect(host, port, patterns, window, base):
+    """Connect, subscribe, collect the latest Record per topic for `window` s.
+
+    Returns ``(records, publisher_state)``: the ``{base}/$state`` liveness topic
+    (and any other ``$``-prefixed attribute) is captured separately as bus
+    health, never parsed as a record.
+    """
     from ebus_mqtt_client import MqttClient
 
     records: dict[str, Record] = {}
+    state: dict[str, str | None] = {"publisher": None}
 
     def handler(topic, payload):
+        if topic.rsplit("/", 1)[-1].startswith("$"):
+            if topic == f"{base}/$state":
+                text = bytes(payload).decode("utf-8", "replace").strip() if payload else ""
+                state["publisher"] = text or None
+            return
         if not payload or not bytes(payload).strip():
             records.pop(topic, None)
             return
@@ -391,10 +412,11 @@ def _collect(host, port, patterns, window):
     mqtt = MqttClient(_CLIENT_ID, host, port)
     for pat in patterns:
         mqtt.subscribe(pat, param=handler)
+    mqtt.subscribe(f"{base}/$state", param=handler)
     mqtt.start()
     time.sleep(window)
     mqtt.stop()
-    return list(records.values())
+    return list(records.values()), state["publisher"]
 
 
 def _service_pattern(base, service_type):
@@ -402,14 +424,19 @@ def _service_pattern(base, service_type):
 
 
 def cmd_dump(args) -> int:
-    records = _collect(
-        args.host, args.port, [_service_pattern(args.base, args.service_type)], args.window
+    records, pub_state = _collect(
+        args.host,
+        args.port,
+        [_service_pattern(args.base, args.service_type)],
+        args.window,
+        args.base,
     )
     if args.interface:
         records = [r for r in records if r.interface == args.interface]
     if args.json:
         print(json.dumps([record_to_debug_json(r) for r in records], indent=2))
     else:
+        print(f"publisher state: {pub_state or 'unknown'}")
         print(render_tree(records))
     return 0
 
@@ -419,6 +446,22 @@ def cmd_watch(args) -> int:
 
     def handler(topic, payload):
         now = datetime.now(timezone.utc)
+        if topic.rsplit("/", 1)[-1].startswith("$"):
+            text = bytes(payload).decode("utf-8", "replace").strip() if payload else ""
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ts": now.isoformat().replace("+00:00", "Z"),
+                            "topic": topic,
+                            "verb": "state",
+                            "state": text or None,
+                        }
+                    )
+                )
+            else:
+                print(f"{now.strftime('%H:%M:%S')} STATE    {topic} = {text or '(cleared)'}")
+            return
         removed = not payload or not bytes(payload).strip()
         rec = None
         if not removed:
@@ -451,6 +494,7 @@ def cmd_watch(args) -> int:
 
     mqtt = MqttClient(_CLIENT_ID, args.host, args.port)
     mqtt.subscribe(_service_pattern(args.base, args.service_type), param=handler)
+    mqtt.subscribe(f"{args.base}/$state", param=handler)
     mqtt.start()
     try:
         while True:
@@ -490,6 +534,8 @@ def cmd_validate(args) -> int:
         collected: dict[str, dict] = {}
 
         def handler(topic, payload):
+            if topic.rsplit("/", 1)[-1].startswith("$"):
+                return  # lifecycle attribute ($state), not a record to validate
             if payload and bytes(payload).strip():
                 try:
                     collected[topic] = json.loads(bytes(payload))
@@ -525,14 +571,19 @@ def cmd_validate(args) -> int:
 
 
 def cmd_snapshot(args) -> int:
-    records = _collect(
-        args.host, args.port, [_service_pattern(args.base, args.service_type)], args.window
+    records, pub_state = _collect(
+        args.host,
+        args.port,
+        [_service_pattern(args.base, args.service_type)],
+        args.window,
+        args.base,
     )
     payload = snapshot_payload(
         [record_to_debug_json(r) for r in records],
         base=args.base,
         host=args.host,
         port=args.port,
+        publisher_state=pub_state,
     )
     text = json.dumps(payload, indent=2)
     if args.output:
@@ -570,14 +621,18 @@ def cmd_diff(args) -> int:
 
 
 def cmd_stats(args) -> int:
-    records = _collect(
-        args.host, args.port, [_service_pattern(args.base, args.service_type)], args.window
+    records, pub_state = _collect(
+        args.host,
+        args.port,
+        [_service_pattern(args.base, args.service_type)],
+        args.window,
+        args.base,
     )
     char = characterize([record_to_debug_json(r) for r in records])
     if args.json:
-        print(json.dumps(char, indent=2))
+        print(json.dumps({"publisher_state": pub_state, **char}, indent=2))
     else:
-        print(render_stats(char, {"base": args.base}))
+        print(render_stats(char, {"base": args.base}, publisher_state=pub_state))
     return 0
 
 
