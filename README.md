@@ -11,7 +11,7 @@ This library is the **consumer side plus the shared wire contract**: the record 
 - [Install](#install)
 - [The contract](#the-contract) — topic, record schema, tombstones, freshness
 - [Library usage](#library-usage) — model, resolver, validation
-- [CLI usage](#cli-usage) — `dump` / `watch` / `resolve` / `validate`, plus `--json`
+- [CLI usage](#cli-usage) — `dump` / `watch` / `resolve` / `validate` / `stats` / `snapshot` / `diff`, plus `--json`
 - [Releasing](#releasing) · [Contributing](#contributing) · [License](#license)
 
 > **Status: alpha.** The API and the v1 contract may still shift before `1.0`.
@@ -260,6 +260,68 @@ service-discovery validate                        # validate live records off th
 ```
 
 Exit code is non-zero if any record is invalid.
+
+### `stats` — characterize the live bus
+
+A one-shot summary of what is currently on the bus: totals, per-interface counts, and the service-type breakdown. `--json` emits the raw characterization dict.
+
+```bash
+service-discovery stats
+```
+
+```
+discovery bus stats
+  base           local/mdns/discovery/v1
+  service-types  12
+  instances      41
+  addresses      63
+  stale          0
+  size           28114 bytes
+  states         active:41
+  scopes         global:6, link-local:9, private:48
+  families       ipv4:55, ipv6:8
+
+  per interface:
+    eth0           38 instances     58 addresses
+    wlan0           3 instances      5 addresses
+
+  by service-type:
+    _airplay._tcp                     9
+    _raop._tcp                        7
+    ...
+```
+
+### `snapshot` / `diff` — soak-test the bus over time
+
+`snapshot` captures the bus plus metadata (`captured_at`, `base`) to a JSON file; `diff` fuzzy-compares two snapshots. The diff deliberately ignores the volatile timestamps and leads with a plain-language "is this network kinda the same?" verdict, so it is meant for "roughly the same shape?" checks, not exact matches.
+
+```bash
+service-discovery snapshot -o mon.json          # capture now
+# ... hours or days later ...
+service-discovery snapshot -o tue.json
+service-discovery diff mon.json tue.json        # what changed?
+```
+
+```
+same core but grew (100% retained, +4 instances, 91% overlap)
+
+between snapshots: 1d  (2026-07-16T01:00:00Z -> 2026-07-17T01:12:00Z)
+
+                       OLD       NEW
+  service-types         12        13   +1
+  instances             41        45   +4
+  addresses             63        70   +7
+  stale                  0         1   +1
+  size (bytes)       28114     30902
+
+  overlap 91%   unchanged 39   changed 2   added 4   removed 0
+
+  + added (4):
+      _http._tcp / eth0 / New Printer
+      ...
+```
+
+`diff` accepts a `snapshot` file or a bare `--json dump` array on either side, and honors `--json` for machine output.
 
 ### `--json` — machine-readable output
 

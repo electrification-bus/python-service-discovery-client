@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-16
+
+### Added
+
+- `service-discovery stats`: characterize the live bus in one shot -- totals,
+  per-interface (instances + addresses), and the service-type breakdown.
+- `service-discovery snapshot`: capture the retained bus plus metadata
+  (`captured_at`, `base`, host) to a JSON file for soak testing over time.
+- `service-discovery diff OLD NEW`: fuzzy-compare two snapshots. Ignores the
+  volatile timestamps and leads with a plain-language "is this network kinda the
+  same?" verdict (keyed on how much of the prior instance set survived), then
+  side-by-side characterization (counts, scope/family histograms, size, age) and
+  the structural delta (instances added / removed / changed). `--json` for
+  machine output.
+
 ## [0.1.0] - 2026-07-16
 
 ### Added
