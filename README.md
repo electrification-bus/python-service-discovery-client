@@ -1,7 +1,10 @@
 # ebus-service-discovery
 
 [![PyPI version](https://img.shields.io/pypi/v/ebus-service-discovery.svg)](https://pypi.org/project/ebus-service-discovery/)
+[![Python versions](https://img.shields.io/pypi/pyversions/ebus-service-discovery.svg)](https://pypi.org/project/ebus-service-discovery/)
+[![CI](https://github.com/electrification-bus/python-service-discovery/actions/workflows/ci.yml/badge.svg)](https://github.com/electrification-bus/python-service-discovery/actions/workflows/ci.yml)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Client and shared model for an mDNS/DNS-SD **service-discovery bus over MQTT**. A discovery service browses the local network and publishes each advertisement as a retained MQTT record; consumers subscribe, keep a fresh view (honoring freshness and tombstones), and resolve a target service to a reachable address per interface.
 
